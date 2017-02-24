@@ -1,0 +1,266 @@
+# vim: ft=python
+import matplotlib
+matplotlib.use('Agg')
+import numpy as np
+import seaborn as sns
+from matplotlib import pyplot as plt
+
+
+configfile: "hpv_config.yaml"
+workdir: os.environ['PWD']
+shell.executable('bash')
+
+# For now, assumes no merging bams
+
+rawbams = sorted(glob.glob(config['raw_path']), key=parse_sampleID)
+
+d = {}
+for key, value in itertools.groupby(rawbams, parse_sampleID):
+    if key.startswith(config['cohort']):
+        d[key] = list(value)
+
+pad_len = bed['HPV%s_Ref' %hpv_type]
+
+localrules: all_cov, make_heat, make_ptrim_heat
+
+rule all_cov:
+    input: 
+        'all_raw_heatmap.png',
+        'all_ptrim_heatmap.png',
+        expand('raw_coverage/{sampleID}.genomecov.txt', sampleID=d.keys())
+
+def get_bams(wc):
+    return d[wc.sampleID]
+
+rule raw_pileup:
+    input: get_bams
+    output: 'raw_pileup/{sampleID}.pileup'
+    run:
+        shell('samtools mpileup -l {len_bed} {input} > {output}')
+
+rule combine_raw:
+    input: expand('raw_pileup/{sampleID}.pileup', sampleID=sampleIDs)
+    output: 'all_raw_pileup.txt'
+    run: 
+        df = pandas.DataFrame()
+        colnames = []
+        for i in input:
+            # use a np array to accomodate positions with no coverage
+            a = np.zeros(shape=(pad_len, 1))
+            infile = open(i, 'r')
+            for line in infile:
+                lines = line.split()
+                if lines[0] != ('HPV%s_Ref' %hpv_type):
+                    continue    # skip the coinfections
+                pos = int(lines[1])
+                reads = int(lines[3])
+                if pos < pad_len-1:
+                    a[pos-1][0] = reads
+                else:
+                    a[pos-401][0] += reads
+
+            infile.close()
+            data = pandas.DataFrame(a)
+            main = df
+            df = pandas.concat([main, data], axis=1)
+    
+            base = i.split('/')[1].split('.')[0]
+            colnames.append(base)
+            
+        df.columns = colnames
+        df.to_csv(output[0], sep='\t', header=True)
+
+
+rule combine_ptrim:
+    input: expand('pileup/{sampleID}.pileup', sampleID=sampleIDs)
+    output: 'all_ptrim_pileup.txt'
+    run:
+        df = pandas.DataFrame()
+        colnames = []
+        for i in input:
+            a = np.zeros(shape=(pad_len, 1))
+            infile = open(i, 'r')
+            for line in infile:
+                lines = line.split()
+                if lines[0] != ('HPV%s_Ref' %hpv_type):
+                    continue
+                pos = int(lines[1])
+                reads = int(lines[3])
+                if pos < pad_len-1:
+                    a[pos-1][0] = reads
+                else:
+                    a[pos-401][0] += reads
+
+            infile.close()
+            data = pandas.DataFrame(a)
+            main = df
+            df = pandas.concat([main, data], axis=1)
+    
+            base = i.split('/')[1].split('.')[0]
+            colnames.append(base)
+            
+        df.columns = colnames
+        df.to_csv(output[0], sep='\t', header=True)
+
+rule make_heat:
+    input: 'all_raw_pileup.txt'
+    output: 'all_raw_heatmap.png'
+    run:
+        # ------- Create Clustermap -------
+        df = pandas.read_table(input[0], sep='\t')
+        df2 = df.transpose()
+       
+        sns.set(style='ticks', palette='Set2')  # prettyplotlib
+        map = sns.clustermap(df2, vmin=0, vmax=20, row_cluster=True, col_cluster=False, yticklabels=False) #, cbar_ax=cbar_ax) #, ax=ax)
+
+        labels = map.ax_heatmap.get_xticklabels()
+        keep = []
+        for i in range(pad_len):
+            if i % 1000 == 0:
+                keep.append(i)
+
+        map.ax_heatmap.set_xticks(keep)
+        map.ax_heatmap.set_xticklabels(keep) #, position=(1000, -500))
+        #map.ax_heatmap.tick_left()
+
+        map.ax_heatmap.set_title('HPV%s genome read coverage' %hpv_type)
+        map.ax_heatmap.set_ylabel('Individual Samples')
+        map.ax_heatmap.set_xlabel('Genome position')
+
+        den = map.ax_row_dendrogram.axes
+        den.set_visible(False)
+
+        #------- Create amplicon bars -------
+        single_bed = config['amplicon_bed']['single'] %hpv_type
+        amp_df = pandas.read_table(single_bed, skiprows = 1,
+            names=['chr', 'start', 'end', 'name', 'score', 'strand', 'thickstart', 'thickend'])
+
+        amps = map.fig.add_subplot(111, sharex=map.ax_heatmap)
+        amp_pos = amps.get_position() 
+        new_amp = [amp_pos.x0+0.16, amp_pos.y0+0.7, amp_pos.width-0.16, 0.08]
+        amps.set_position(new_amp)
+        amps.set_title('Amplicon Coverage (bottom) and Gene Location (top)')
+        amps.xaxis.set_ticks_position('bottom')
+        plt.setp(amps.get_yticklabels(), visible=False)
+        plt.setp(amps.get_yticklines(), visible=False)
+
+        for i in range(len(amp_df['start'])):
+            start = int(amp_df['start'][i])
+            stop = int(amp_df['end'][i])
+            if start < pad_len:
+                rect = plt.Rectangle((start, 0.2), stop-start, 0.2, facecolor='g', alpha=0.3, linewidth=0)
+                amps.add_patch(rect)
+
+               # for some reason plot creates rounded lines that extend past the data point 
+               # amps.plot([start, stop], [0.5, 0.5], linestyle='solid')
+               
+        # Plot gene bars
+        ann = open(config['annotation']['single'] %hpv_type, 'r')
+        colors = ['r', 'b']
+        count = 2
+        for line in ann:
+            if line.startswith('#'):
+                continue
+            elif line.split()[2] == 'gene':
+                gene = line.split()[9].replace('"', '').replace(';','')
+                start = int(line.split()[3])
+                stop = int(line.split()[4])
+                rect = plt.Rectangle((start, 0.4), stop-start, 0.2, facecolor=colors[count%len(colors)], alpha=0.3, linewidth=0)
+                amps.add_patch(rect)
+                count += 1
+                amps.text(start, 0.7, gene)
+        ann.close()
+
+        #------- Fix Colorbar -------        
+
+        pos = map.cax.get_position()
+        new_pos = [pos.x0, pos.y0-0.2, pos.width, pos.height]
+        map.cax.set_position(new_pos)
+        map.cax.set_title('Read Coverage', y=1.08)
+        #ticks = map.cax.yaxis.get_ticklabels()
+        #ticks[-1] = str(ticks[-1]) + '+'
+        #map.cax.yaxis.set_ticklabels(ticks)
+
+        plt.savefig(output[0])
+        
+rule make_ptrim_heat:
+    input: 'all_ptrim_pileup.txt'
+    output: 'all_ptrim_heatmap.png'
+    run:
+        # ------- Create Clustermap -------
+        df = pandas.read_table(input[0], sep='\t')
+        df2 = df.transpose()
+       
+        sns.set(style='ticks', palette='Set2')  # prettyplotlib
+        map = sns.clustermap(df2, vmin=0, vmax=20, row_cluster=True, col_cluster=False, yticklabels=False) #, cbar_ax=cbar_ax) #, ax=ax)
+
+        labels = map.ax_heatmap.get_xticklabels()
+        keep = []
+        for i in range(pad_len):
+            if i % 1000 == 0:
+                keep.append(i)
+
+        map.ax_heatmap.set_xticks(keep)
+        map.ax_heatmap.set_xticklabels(keep) #, position=(1000, -500))
+        #map.ax_heatmap.tick_left()
+
+        map.ax_heatmap.set_title('HPV%s genome read coverage' %hpv_type)
+        map.ax_heatmap.set_ylabel('Individual Samples')
+        map.ax_heatmap.set_xlabel('Genome position')
+        
+        den = map.ax_row_dendrogram.axes
+        den.set_visible(False)
+
+        #------- Create amplicon bars -------
+        single_bed = config['amplicon_bed']['single'] %hpv_type
+        amp_df = pandas.read_table(single_bed, skiprows = 1,
+            names=['chr', 'start', 'end', 'name', 'score', 'strand', 'thickstart', 'thickend'])
+
+        amps = map.fig.add_subplot(111, sharex=map.ax_heatmap)
+        amp_pos = amps.get_position() 
+        new_amp = [amp_pos.x0+0.16, amp_pos.y0+0.7, amp_pos.width-0.16, 0.08]
+        amps.set_position(new_amp)
+        amps.set_title('Amplicon Coverage (bottom) and Gene Location (top)')
+        amps.xaxis.set_ticks_position('bottom')
+        plt.setp(amps.get_yticklabels(), visible=False)
+        plt.setp(amps.get_yticklines(), visible=False)
+
+        for i in range(len(amp_df['start'])):
+            start = int(amp_df['start'][i])
+            stop = int(amp_df['end'][i])
+            if start < pad_len:
+                rect = plt.Rectangle((start, 0.2), stop-start, 0.2, facecolor='g', alpha=0.3, linewidth=0)
+                amps.add_patch(rect)
+
+               # for some reason plot creates rounded lines that extend past the data point 
+               # amps.plot([start, stop], [0.5, 0.5], linestyle='solid')
+               
+        # Plot gene bars
+        ann = open(config['annotation']['single'] %hpv_type, 'r')
+        colors = ['r', 'b']
+        count = 2
+        for line in ann:
+            if line.startswith('#'):
+                continue
+            elif line.split()[2] == 'gene':
+                gene = line.split()[9].replace('"', '').replace(';','')
+                start = int(line.split()[3])
+                stop = int(line.split()[4])
+                rect = plt.Rectangle((start, 0.4), stop-start, 0.2, facecolor=colors[count%len(colors)], alpha=0.3, linewidth=0)
+                amps.add_patch(rect)
+                count += 1
+                amps.text(start, 0.7, gene)
+        ann.close()
+
+        #------- Fix Colorbar -------        
+
+        pos = map.cax.get_position()
+        new_pos = [pos.x0, pos.y0-0.2, pos.width, pos.height]
+        map.cax.set_position(new_pos)
+        map.cax.set_title('Read Coverage', y=1.08)
+        #ticks = map.cax.yaxis.get_ticklabels()
+        #ticks[-1] = str(ticks[-1]) + '+'
+        #map.cax.yaxis.set_ticklabels(ticks)
+
+        plt.savefig(output[0])
+

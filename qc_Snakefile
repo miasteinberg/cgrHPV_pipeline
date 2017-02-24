@@ -1,0 +1,35 @@
+# vim: ft=python
+
+configfile: 'hpv_config.yaml'
+workdir: os.environ['PWD']
+shell.executable('bash')
+
+localrules: all_qc
+
+rule all_qc:
+    input: 
+        expand('posttrim_qc/{sampleID}.filtered_fastqc.zip', sampleID=sampleIDs),
+        'multiqc/fastqc_report.html'
+
+rule pretrim_qc:
+    input: 'bams/{sampleID}.bam'
+    output: 'pretrim_qc/{sampleID}_fastqc.zip'
+    threads: 4
+    run:
+        shell('fastqc {input} -t {threads} --outdir=pretrim_qc')
+
+rule posttrim_qc:
+    input: 'mapq_filter/{sampleID}.filtered.bam'
+    output: 'posttrim_qc/{sampleID}.filtered_fastqc.zip'
+    threads: 4
+    run:
+        shell('fastqc {input} -t {threads} --outdir=posttrim_qc')
+
+rule fastqc_report:
+    input:
+        expand('pretrim_qc/{sampleID}_fastqc.zip', sampleID=sampleIDs),
+        expand('posttrim_qc/{sampleID}.filtered_fastqc.zip', sampleID=sampleIDs)
+    output: 'multiqc/fastqc_report.html'
+    run:
+        shell('multiqc -d pretrim_qc posttrim_qc -o multiqc -n fastqc_report')
+
